@@ -42,6 +42,14 @@ type ProviderConfigSpec struct {
 	// +optional
 	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
 
+	// CABundleSecretRef references a secret in the controller's namespace holding a
+	// PEM-encoded CA bundle under the key `ca.crt`. When set, the secret is replicated
+	// into tenant namespaces and wired as certSecretRef on the OCIRepository.
+	// Kro, at the moment, does not allow custom certificates only extra mounts which
+	// makes it rather brittle, therefore we rely on Flux doing the heavy lifting.
+	// +optional
+	CABundleSecretRef *corev1.LocalObjectReference `json:"caBundleSecretRef,omitempty"`
+
 	// Values are arbitrary Helm values passed directly to the managed HelmRelease.
 	// +optional
 	Values *apiextensionsv1.JSON `json:"values,omitempty"`
@@ -129,4 +137,12 @@ func (o *ProviderConfig) GetImagePullSecret() *corev1.LocalObjectReference {
 		return nil
 	}
 	return o.Spec.ImagePullSecret
+}
+
+// GetCABundleSecretRef returns the CA bundle secret reference or nil if unset. Nil-safe.
+func (o *ProviderConfig) GetCABundleSecretRef() *corev1.LocalObjectReference {
+	if o == nil {
+		return nil
+	}
+	return o.Spec.CABundleSecretRef
 }
