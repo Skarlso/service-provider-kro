@@ -128,17 +128,17 @@ func TestServiceProvider(t *testing.T) {
 			mcpConfig, err := clusterutils.MCPConfig(ctx, c, mcpName)
 			if err != nil {
 				t.Errorf("failed to get MCP config: %v", err)
-			} else {
-				rgd := &unstructured.Unstructured{}
-				rgd.SetGroupVersionKind(schema.GroupVersionKind{
-					Group:   "kro.run",
-					Version: "v1alpha1",
-					Kind:    "ResourceGraphDefinition",
-				})
-				rgd.SetName("noop") // cluster-scoped, no namespace
-				if err := resources.DeleteObject(ctx, mcpConfig, rgd, wait.WithTimeout(time.Minute)); err != nil {
-					t.Errorf("failed to delete ResourceGraphDefinition from MCP: %v", err)
-				}
+			}
+
+			rgd := &unstructured.Unstructured{}
+			rgd.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "kro.run",
+				Version: "v1alpha1",
+				Kind:    "ResourceGraphDefinition",
+			})
+			rgd.SetName("noop") // cluster-scoped, no namespace
+			if err := resources.DeleteObject(ctx, mcpConfig, rgd, wait.WithTimeout(time.Minute)); err != nil {
+				t.Errorf("failed to delete ResourceGraphDefinition from MCP: %v", err)
 			}
 
 			onboardingConfig, err := clusterutils.OnboardingConfig()
