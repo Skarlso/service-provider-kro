@@ -201,11 +201,6 @@ func (in *ProviderConfigSpec) DeepCopyInto(out *ProviderConfigSpec) {
 		*out = new(corev1.LocalObjectReference)
 		**out = **in
 	}
-	if in.CABundleSecretRef != nil {
-		in, out := &in.CABundleSecretRef, &out.CABundleSecretRef
-		*out = new(corev1.LocalObjectReference)
-		**out = **in
-	}
 	if in.Values != nil {
 		in, out := &in.Values, &out.Values
 		*out = new(apiextensionsv1.JSON)

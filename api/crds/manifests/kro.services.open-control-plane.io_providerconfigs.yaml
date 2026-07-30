@@ -41,25 +41,6 @@ spec:
           spec:
             description: spec defines the desired state of ProviderConfig
             properties:
-              caBundleSecretRef:
-                description: |-
-                  CABundleSecretRef references a secret in the controller's namespace holding a
-                  PEM-encoded CA bundle under the key `ca.crt`. When set, the secret is replicated
-                  into tenant namespaces and wired as certSecretRef on the OCIRepository.
-                  Kro, at the moment, does not allow custom certificates only extra mounts which
-                  makes it rather brittle, therefore we rely on Flux doing the heavy lifting.
-                properties:
-                  name:
-                    default: ""
-                    description: |-
-                      Name of the referent.
-                      This field is effectively required, but due to backwards compatibility is
-                      allowed to be empty. Instances of this type with an empty value here are
-                      almost certainly wrong.
-                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                    type: string
-                type: object
-                x-kubernetes-map-type: atomic
               chartURL:
                 default: oci://registry.k8s.io/kro/charts/kro
                 description: ChartURL is the OCI URL of the Helm chart. Defaults to

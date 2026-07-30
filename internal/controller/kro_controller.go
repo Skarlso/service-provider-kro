@@ -94,11 +94,6 @@ func (r *KroReconciler) CreateOrUpdate(ctx context.Context, svcobj *apiv1alpha1.
 		return ctrl.Result{}, fmt.Errorf("failed to replicate image pull secret: %w", err)
 	}
 
-	if err := r.replicateCABundleSecret(ctx, providerConfig, tenantNamespace); err != nil {
-		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
-		return ctrl.Result{}, fmt.Errorf("failed to replicate CA bundle secret: %w", err)
-	}
-
 	ociRepo, err := r.createOrUpdateOCIRepository(ctx, svcobj, clusterCtx, tenantNamespace, providerConfig)
 	if err != nil {
 		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
@@ -298,16 +293,6 @@ func (r *KroReconciler) replicateImagePullSecret(ctx context.Context, providerCo
 	return nil
 }
 
-// replicateCABundleSecret copies the configured CA bundle secret from the controller's
-// namespace into the tenant namespace so the OCIRepository can reference it as
-// certSecretRef when pulling the kro chart. A no-op if no CA bundle is configured.
-func (r *KroReconciler) replicateCABundleSecret(ctx context.Context, providerConfig *apiv1alpha1.ProviderConfig, targetNamespace string) error {
-	if err := r.replicateSecret(ctx, providerConfig.GetCABundleSecretRef(), targetNamespace); err != nil {
-		return fmt.Errorf("failed to replicate CA bundle secret: %w", err)
-	}
-	return nil
-}
-
 // replicateSecret copies a secret referenced by name from the controller's namespace
 // (r.PodNamespace) on the platform cluster into targetNamespace. A nil ref is a no-op.
 func (r *KroReconciler) replicateSecret(ctx context.Context, ref *corev1.LocalObjectReference, targetNamespace string) error {
@@ -446,21 +431,15 @@ func createOciRepository(providerConfig *apiv1alpha1.ProviderConfig, version, na
 		secretRef = &meta.LocalObjectReference{Name: ref.Name}
 	}
 
-	var certSecretRef *meta.LocalObjectReference
-	if ref := providerConfig.GetCABundleSecretRef(); ref != nil {
-		certSecretRef = &meta.LocalObjectReference{Name: ref.Name}
-	}
-
 	return &sourcev1.OCIRepository{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      OCIRepositoryName,
 			Namespace: namespace,
 		},
 		Spec: sourcev1.OCIRepositorySpec{
-			Interval:      metav1.Duration{Duration: time.Minute},
-			URL:           ensureOCIScheme(providerConfig.GetChartURL()),
-			SecretRef:     secretRef,
-			CertSecretRef: certSecretRef,
+			Interval:  metav1.Duration{Duration: time.Minute},
+			URL:       ensureOCIScheme(providerConfig.GetChartURL()),
+			SecretRef: secretRef,
 			Reference: &sourcev1.OCIRepositoryRef{
 				Tag: version,
 			},

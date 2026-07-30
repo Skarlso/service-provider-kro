@@ -51,8 +51,6 @@ spec:
   chartURL: oci://registry.k8s.io/kro/charts/kro
   imagePullSecret:
     name: my-registry-secret
-  caBundleSecretRef:
-    name: my-registry-ca
   values:
     # See https://github.com/kubernetes-sigs/kro/blob/main/helm/values.yaml
     # for all available configuration options including:
@@ -70,7 +68,6 @@ spec:
 | `chartURL`          | `string`               | no       | `oci://registry.k8s.io/kro/charts/kro` | OCI URL of the Helm chart (`oci://` prefix is added automatically if missing)                                                                                                                                      |
 | `pollInterval`      | `duration`             | no       | `1m`                                   | How often the controller polls for changes                                                                                                                                                                         |
 | `imagePullSecret`   | `LocalObjectReference` | no       | —                                      | Secret to replicate from the controller's namespace into tenant namespaces and set as `secretRef` on the `OCIRepository`                                                                                           |
-| `caBundleSecretRef` | `LocalObjectReference` | no       | —                                      | Secret in the controller's namespace holding a PEM CA bundle under `ca.crt`. Replicated into tenant namespaces and set as `certSecretRef` on the `OCIRepository` so Flux trusts a custom CA when pulling the chart |
 | `values`            | `object`               | no       | —                                      | Arbitrary Helm values passed directly to the HelmRelease                                                                                                                                                           |
 
 ## What is Kro
@@ -94,7 +91,7 @@ task test-e2e
 | Status reporting & error messages |   ✅   |                                                                                                                                                                                                                                                                                                                                                            |
 | Operation annotations             |   ✅   | Both `openmcp.cloud/operation: ignore` (skip reconciliation) and `openmcp.cloud/operation: reconcile` (one-shot manual reconcile; the annotation is consumed) are processed.                                                                                                                                                                               |
 | API stability policy              |   ✅   |                                                                                                                                                                                                                                                                                                                                                            |
-| Custom CA support                 |   ⚠️   | A custom CA bundle (`spec.caBundleSecretRef`) is trusted when Flux pulls the kro chart (wired as `certSecretRef` on the `OCIRepository`). Propagation into the kro controller pod itself is not done: kro's chart exposes only `extraVolumes`/`extraVolumeMounts` (no env hook), so there is no reliable way to point its TLS trust store at a mounted CA. |
+| Custom CA support                 |   ✅   | Not required for kro. The platform-cluster Flux instance is assumed to be preconfigured with the necessary CA bundles for chart pulls, so no `certSecretRef` is set on the `OCIRepository`. Custom CA bundles are only needed for workloads running on the `ControlPlane` that reach private endpoints themselves (e.g. crossplane's pods pulling provider images); kro's controller has no such need. |
 | Release artifacts (image + OCM)   |   ✅   |                                                                                                                                                                                                                                                                                                                                                            |
 | Testing                           |   ✅   |                                                                                                                                                                                                                                                                                                                                                            |
 | Ownership and maintenance docs    |   ✅   |                                                                                                                                                                                                                                                                                                                                                            |

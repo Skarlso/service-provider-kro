@@ -117,32 +117,18 @@ func TestResourceStatus(t *testing.T) {
 
 func TestCreateOciRepository_SecretRefs(t *testing.T) {
 	tests := []struct {
-		name              string
-		imagePullSecret   *corev1.LocalObjectReference
-		caBundleSecretRef *corev1.LocalObjectReference
-		wantSecretRef     string
-		wantCertSecretRef string
+		name            string
+		imagePullSecret *corev1.LocalObjectReference
+		wantSecretRef   string
 	}{
 		{
-			name:          "no secrets configured",
-			wantSecretRef: "", wantCertSecretRef: "",
+			name:          "no secret configured",
+			wantSecretRef: "",
 		},
 		{
-			name:              "ca bundle only wires certSecretRef",
-			caBundleSecretRef: &corev1.LocalObjectReference{Name: "my-ca"},
-			wantCertSecretRef: "my-ca",
-		},
-		{
-			name:            "image pull secret only wires secretRef",
+			name:            "image pull secret wires secretRef",
 			imagePullSecret: &corev1.LocalObjectReference{Name: "my-pull"},
 			wantSecretRef:   "my-pull",
-		},
-		{
-			name:              "both configured wire both refs independently",
-			imagePullSecret:   &corev1.LocalObjectReference{Name: "my-pull"},
-			caBundleSecretRef: &corev1.LocalObjectReference{Name: "my-ca"},
-			wantSecretRef:     "my-pull",
-			wantCertSecretRef: "my-ca",
 		},
 	}
 	for _, tc := range tests {
@@ -150,9 +136,8 @@ func TestCreateOciRepository_SecretRefs(t *testing.T) {
 			chartURL := "oci://registry.k8s.io/kro/charts/kro"
 			pc := &apiv1alpha1.ProviderConfig{
 				Spec: apiv1alpha1.ProviderConfigSpec{
-					ChartURL:          &chartURL,
-					ImagePullSecret:   tc.imagePullSecret,
-					CABundleSecretRef: tc.caBundleSecretRef,
+					ChartURL:        &chartURL,
+					ImagePullSecret: tc.imagePullSecret,
 				},
 			}
 			repo := createOciRepository(pc, "1.2.3", "tenant")
@@ -162,12 +147,6 @@ func TestCreateOciRepository_SecretRefs(t *testing.T) {
 			} else {
 				require.NotNil(t, repo.Spec.SecretRef)
 				assert.Equal(t, tc.wantSecretRef, repo.Spec.SecretRef.Name)
-			}
-			if tc.wantCertSecretRef == "" {
-				assert.Nil(t, repo.Spec.CertSecretRef)
-			} else {
-				require.NotNil(t, repo.Spec.CertSecretRef)
-				assert.Equal(t, tc.wantCertSecretRef, repo.Spec.CertSecretRef.Name)
 			}
 		})
 	}
