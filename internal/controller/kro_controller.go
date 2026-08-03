@@ -30,8 +30,11 @@ import (
 	"github.com/openmcp-project/openmcp-operator/lib/clusteraccess"
 	libutils "github.com/openmcp-project/openmcp-operator/lib/utils"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -49,6 +52,16 @@ const (
 	KroSystemNamespace = "kro-system"
 	// requestSuffixMCP is the suffix used for the mcp cluster.
 	requestSuffixMCP = "--mcp"
+
+	// kroAPIGroup is the API group under which kro serves its custom resources.
+	kroAPIGroup = "kro.run"
+	// kroAPIVersion is the API version of kro's ResourceGraphDefinition resource.
+	kroAPIVersion = "v1alpha1"
+	// resourceGraphDefinitionListKind is the list kind of kro's ResourceGraphDefinition resource.
+	resourceGraphDefinitionListKind = "ResourceGraphDefinitionList"
+	// deletionBlockedRequeue is how long to wait before re-checking whether the
+	// user's kro resources have been removed and deletion may proceed.
+	deletionBlockedRequeue = 10 * time.Second
 )
 
 // ClusterAccessName is the name of the access object containing the kubeconfig for the mcp target cluster.
@@ -135,12 +148,29 @@ func (r *KroReconciler) CreateOrUpdate(ctx context.Context, svcobj *apiv1alpha1.
 }
 
 // Delete is called on every delete event
-func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, providerConfig *apiv1alpha1.ProviderConfig, _ spruntime.ClusterContext) (ctrl.Result, error) {
+func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, providerConfig *apiv1alpha1.ProviderConfig, clusterCtx spruntime.ClusterContext) (ctrl.Result, error) {
+	l := logf.FromContext(ctx)
 	spruntime.StatusTerminating(obj)
 
 	tenantNamespace, err := libutils.StableMCPNamespace(obj.Name, obj.Namespace)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to determine stable namespace for Kro instance: %w", err)
+	}
+
+	// Block deletion until the user has no more Kro objects left.
+	if clusterCtx.MCPCluster != nil {
+		remaining, err := r.countResourceGraphDefinitions(ctx, clusterCtx.MCPCluster)
+		if err != nil {
+			spruntime.StatusProgressing(obj, spruntime.StatusPhaseFailed, err.Error())
+			return ctrl.Result{}, fmt.Errorf("failed to check for remaining ResourceGraphDefinitions: %w", err)
+		}
+		if remaining > 0 {
+			msg := fmt.Sprintf("deletion blocked: waiting for %d kro ResourceGraphDefinition(s) to be removed from the control plane", remaining)
+			l.Info(msg)
+			spruntime.StatusTerminatingMessage(obj, msg)
+			obj.Status.Resources = managedResources(tenantNamespace, apiv1alpha1.Terminating)
+			return ctrl.Result{RequeueAfter: deletionBlockedRequeue}, nil
+		}
 	}
 
 	obj.Status.Resources = managedResources(tenantNamespace, apiv1alpha1.Terminating)
@@ -177,6 +207,25 @@ func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, provid
 	obj.Status.Resources = nil
 	spruntime.StatusReady(obj)
 	return ctrl.Result{}, nil
+}
+
+// countResourceGraphDefinitions returns the number of kro ResourceGraphDefinition
+// objects present on the given (control plane) cluster. If the kind is not installed
+// this just returns 0.
+func (r *KroReconciler) countResourceGraphDefinitions(ctx context.Context, mcpCluster *clusters.Cluster) (int, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   kroAPIGroup,
+		Version: kroAPIVersion,
+		Kind:    resourceGraphDefinitionListKind,
+	})
+	if err := mcpCluster.Client().List(ctx, list); err != nil {
+		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return len(list.Items), nil
 }
 
 // managedResources returns the set of platform-cluster objects this controller
@@ -238,7 +287,15 @@ func (r *KroReconciler) getMcpFluxConfig(ctx context.Context, namespace, objectN
 }
 
 func (r *KroReconciler) replicateImagePullSecret(ctx context.Context, providerConfig *apiv1alpha1.ProviderConfig, targetNamespace string) error {
-	ref := providerConfig.GetImagePullSecret()
+	if err := r.replicateSecret(ctx, providerConfig.GetImagePullSecret(), targetNamespace); err != nil {
+		return fmt.Errorf("failed to replicate image pull secret: %w", err)
+	}
+	return nil
+}
+
+// replicateSecret copies a secret referenced by name from the controller's namespace
+// (r.PodNamespace) on the platform cluster into targetNamespace. A nil ref is a no-op.
+func (r *KroReconciler) replicateSecret(ctx context.Context, ref *corev1.LocalObjectReference, targetNamespace string) error {
 	if ref == nil {
 		return nil
 	}
@@ -247,7 +304,7 @@ func (r *KroReconciler) replicateImagePullSecret(ctx context.Context, providerCo
 	sourceSecret := &corev1.Secret{}
 	sourceKey := client.ObjectKey{Name: ref.Name, Namespace: r.PodNamespace}
 	if err := platformClient.Get(ctx, sourceKey, sourceSecret); err != nil {
-		return fmt.Errorf("failed to get image pull secret %q from namespace %q: %w", ref.Name, r.PodNamespace, err)
+		return fmt.Errorf("failed to get secret %q from namespace %q: %w", ref.Name, r.PodNamespace, err)
 	}
 
 	targetSecret := &corev1.Secret{
@@ -261,7 +318,7 @@ func (r *KroReconciler) replicateImagePullSecret(ctx context.Context, providerCo
 		targetSecret.Type = sourceSecret.Type
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to replicate image pull secret %q to namespace %q: %w", ref.Name, targetNamespace, err)
+		return fmt.Errorf("failed to replicate secret %q to namespace %q: %w", ref.Name, targetNamespace, err)
 	}
 
 	return nil

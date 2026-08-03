@@ -228,6 +228,33 @@ func TestSPReconciler_Reconcile(t *testing.T) {
 			wantErr:            false,
 		},
 		{
+			name: "Operation annotation reconcile -> reconciliation happens, requeue with pc poll interval",
+			apiObj: &fakeApiImpl{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testObjectName,
+					Namespace: testNamespaceName,
+					Annotations: map[string]string{
+						apiconst.OperationAnnotation: apiconst.OperationAnnotationValueReconcile,
+					},
+				},
+			},
+			req: ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      testObjectName,
+					Namespace: testNamespaceName,
+				},
+			},
+			providerConfig: &fakeProviderConfigImpl{
+				FakePollInterval: time.Hour,
+			},
+			want: ctrl.Result{
+				RequeueAfter: time.Hour,
+			},
+			wantStatusPhase:    StatusPhaseReady,
+			wantReconciliation: true,
+			wantErr:            false,
+		},
+		{
 			name: "cluster access reconciler fails -> error and status update",
 			apiObj: &fakeApiImpl{
 				ObjectMeta: metav1.ObjectMeta{
@@ -331,6 +358,49 @@ func TestSPReconciler_Reconcile(t *testing.T) {
 			assertStatusUpdate(t, onboardingCluster.Client(), tt.req, tt.wantStatusPhase)
 		})
 	}
+}
+
+func TestSPReconciler_ReconcileAnnotationConsumed(t *testing.T) {
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: testObjectName, Namespace: testNamespaceName}}
+	apiObj := &fakeApiImpl{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testObjectName,
+			Namespace: testNamespaceName,
+			Annotations: map[string]string{
+				apiconst.OperationAnnotation: apiconst.OperationAnnotationValueReconcile,
+				"keep.me/annotation":         "value",
+			},
+		},
+	}
+	onboardingCluster := createFakeCluster(t, "onboarding", apiObj)
+	mockSPR := &MockServiceProviderReconciler{}
+	r := NewSPReconciler[*fakeApiImpl, *fakeProviderConfigImpl](func() *fakeApiImpl {
+		return &fakeApiImpl{}
+	}).
+		WithOnboardingCluster(onboardingCluster).
+		WithPlatformCluster(createFakeCluster(t, "platform")).
+		WithClusterAccessReconciler(FakeClusterAccessProvider{
+			ManagedControlPlane: createFakeCluster(t, testMCPName),
+			ManagedControlPlaneAR: &clustersv1alpha1.AccessRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: testMCPName, Namespace: testNamespaceName},
+				Status:     clustersv1alpha1.AccessRequestStatus{SecretRef: &common.LocalObjectReference{Name: testMCPKubeconfig}},
+			},
+		}).
+		WithServiceProviderReconciler(mockSPR).
+		WithProviderConfig(&fakeProviderConfigImpl{FakePollInterval: time.Hour})
+
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	// The reconcile still happened
+	assert.True(t, mockSPR.createOrUpdateCalled, "expected reconciliation to proceed after consuming the annotation")
+
+	// and the operation annotation is gone but keep.me remains.
+	got := &fakeApiImpl{}
+	require.NoError(t, onboardingCluster.Client().Get(context.Background(), req.NamespacedName, got))
+	_, hasOperation := got.GetAnnotations()[apiconst.OperationAnnotation]
+	assert.False(t, hasOperation, "reconcile operation annotation should be removed")
+	assert.Equal(t, "value", got.GetAnnotations()["keep.me/annotation"], "unrelated annotations must be preserved")
 }
 
 func assertStatusUpdate(t *testing.T, c client.Client, req ctrl.Request, wantStatusPhase string) {

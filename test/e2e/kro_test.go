@@ -12,6 +12,7 @@ import (
 	"github.com/openmcp-project/openmcp-testing/pkg/conditions"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
@@ -123,6 +124,23 @@ func TestServiceProvider(t *testing.T) {
 		}).
 		Assess("verify domain objects can be created", providers.ImportDomainAPIs(mcpName, "mcp")).
 		Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			// Remove things first because of the finalizer.
+			mcpConfig, err := clusterutils.MCPConfig(ctx, c, mcpName)
+			if err != nil {
+				t.Errorf("failed to get MCP config: %v", err)
+			}
+
+			rgd := &unstructured.Unstructured{}
+			rgd.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "kro.run",
+				Version: "v1alpha1",
+				Kind:    "ResourceGraphDefinition",
+			})
+			rgd.SetName("noop") // cluster-scoped, no namespace
+			if err := resources.DeleteObject(ctx, mcpConfig, rgd, wait.WithTimeout(time.Minute)); err != nil {
+				t.Errorf("failed to delete ResourceGraphDefinition from MCP: %v", err)
+			}
+
 			onboardingConfig, err := clusterutils.OnboardingConfig()
 			if err != nil {
 				t.Error(err)

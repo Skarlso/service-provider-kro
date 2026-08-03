@@ -196,15 +196,28 @@ func (r *SPReconciler[T, PC]) WithProviderConfig(config PC) *SPReconciler[T, PC]
 // Reconcile orchestrates platform and DomainServiceReconciler logic to reconcile APIObjects
 func (r *SPReconciler[T, PC]) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, reconcileErr error) {
 	l := logf.FromContext(ctx)
-	// common reconciler logic including get obj, providerconfig, mcp/workload access
+	// common reconciler logic including get obj, providerconfig, mcp/workload access.
 	obj := r.emptyObj()
 	if err := r.onboardingCluster.Client().Get(ctx, req.NamespacedName, obj); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	// Skip reconciliation if annotation is set
+	// Skip reconciliation if annotation is set.
 	if obj.GetAnnotations()[apiconst.OperationAnnotation] == apiconst.OperationAnnotationValueIgnore {
 		l.Info("Skipping resource due to ignore operation annotation")
 		return ctrl.Result{}, nil
+	}
+	// Honor a manual reconcile trigger.
+	if obj.GetAnnotations()[apiconst.OperationAnnotation] == apiconst.OperationAnnotationValueReconcile {
+		l.Info("Consuming reconcile operation annotation")
+		patched := obj.DeepCopyObject().(T)
+		annotations := patched.GetAnnotations()
+		delete(annotations, apiconst.OperationAnnotation)
+		patched.SetAnnotations(annotations)
+		if err := r.onboardingCluster.Client().Patch(ctx, patched, client.MergeFrom(obj)); err != nil {
+			l.Error(err, "failed to remove reconcile operation annotation")
+			return ctrl.Result{}, err
+		}
+		obj = patched
 	}
 	oldObj := obj.DeepCopyObject().(T)
 	// always try to update the obj status
