@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
@@ -30,6 +29,7 @@ import (
 	"github.com/openmcp-project/openmcp-operator/lib/clusteraccess"
 	libutils "github.com/openmcp-project/openmcp-operator/lib/utils"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -89,21 +89,30 @@ func (r *KroReconciler) CreateOrUpdate(ctx context.Context, svcobj *apiv1alpha1.
 
 	l.Info("checking tenantNamespace", "namespace", tenantNamespace)
 
-	if err := r.replicateImagePullSecret(ctx, providerConfig, tenantNamespace); err != nil {
+	// Map the tenant requested version onto the artifacts the ProviderConfig offers for it.
+	version, err := providerConfig.ResolveVersion(svcobj.Spec.Version)
+	if err != nil {
+		l.Info("requested version is not offered by the provider config", "version", svcobj.Spec.Version, "error", err.Error())
 		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
-		return ctrl.Result{}, fmt.Errorf("failed to replicate image pull secret: %w", err)
+		return ctrl.Result{}, nil
+	}
+	l.Info("resolved requested version", "version", version.Version, "chartVersion", version.ChartVersion, "chartURL", version.GetChartURL())
+
+	if err := r.replicateChartPullSecret(ctx, version.ChartPullSecret, tenantNamespace); err != nil {
+		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to replicate chart pull secret: %w", err)
 	}
 
-	ociRepo, err := r.createOrUpdateOCIRepository(ctx, svcobj, clusterCtx, tenantNamespace, providerConfig)
+	ociRepo, err := r.createOrUpdateOCIRepository(ctx, version, tenantNamespace)
 	if err != nil {
 		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile OCI Repository: %w", err)
 	}
-	if err := r.replicateMCPImagePullSecrets(ctx, clusterCtx.MCPCluster, providerConfig); err != nil {
+	if err := r.replicateMCPImagePullSecrets(ctx, clusterCtx.MCPCluster, version.HelmValues); err != nil {
 		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to replicate MCP image pull secrets: %w", err)
 	}
-	helmRel, err := r.createOrUpdateHelmRelease(ctx, tenantNamespace, svcobj, providerConfig)
+	helmRel, err := r.createOrUpdateHelmRelease(ctx, tenantNamespace, svcobj, version.HelmValues)
 	if err != nil {
 		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile HelmRelease: %w", err)
@@ -147,8 +156,8 @@ func (r *KroReconciler) CreateOrUpdate(ctx context.Context, svcobj *apiv1alpha1.
 	return ctrl.Result{}, nil
 }
 
-// Delete is called on every delete event
-func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, providerConfig *apiv1alpha1.ProviderConfig, clusterCtx spruntime.ClusterContext) (ctrl.Result, error) {
+// Delete is called on every delete event.
+func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, _ *apiv1alpha1.ProviderConfig, clusterCtx spruntime.ClusterContext) (ctrl.Result, error) {
 	l := logf.FromContext(ctx)
 	spruntime.StatusTerminating(obj)
 
@@ -175,15 +184,14 @@ func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, provid
 
 	obj.Status.Resources = managedResources(tenantNamespace, apiv1alpha1.Terminating)
 
-	var objects []client.Object
-	ociRepository := createOciRepository(providerConfig, obj.Spec.Version, tenantNamespace)
-	objects = append(objects, ociRepository)
-	helmRelease, err := r.createHelmRelease(ctx, tenantNamespace, obj, providerConfig)
-	if err != nil {
-		spruntime.StatusProgressing(obj, spruntime.StatusPhaseFailed, err.Error())
-		return ctrl.Result{}, fmt.Errorf("failed to create helm release: %w", err)
+	objects := []client.Object{
+		&sourcev1.OCIRepository{
+			ObjectMeta: metav1.ObjectMeta{Name: OCIRepositoryName, Namespace: tenantNamespace},
+		},
+		&helmv2.HelmRelease{
+			ObjectMeta: metav1.ObjectMeta{Name: HelmReleaseName, Namespace: tenantNamespace},
+		},
 	}
-	objects = append(objects, helmRelease)
 
 	objectsStillExist := false
 	for _, managedObj := range objects {
@@ -191,9 +199,9 @@ func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, provid
 			spruntime.StatusProgressing(obj, spruntime.StatusPhaseFailed, err.Error())
 			return ctrl.Result{}, fmt.Errorf("delete object failed: %w", err)
 		}
-		// we ignore any other error because we assume that if deleting worked, getting should not fail with anything other than
-		// not found.
-		if err := r.PlatformCluster.Client().Get(ctx, client.ObjectKeyFromObject(managedObj), managedObj); client.IgnoreNotFound(err) != nil {
+		// Only a NotFound confirms the object is gone. A successful Get means it is still
+		// there, and any other error leaves us unsure, so re-check on the requeue.
+		if err := r.PlatformCluster.Client().Get(ctx, client.ObjectKeyFromObject(managedObj), managedObj); !apierrors.IsNotFound(err) {
 			objectsStillExist = true
 		}
 	}
@@ -286,30 +294,24 @@ func (r *KroReconciler) getMcpFluxConfig(ctx context.Context, namespace, objectN
 	}, nil
 }
 
-func (r *KroReconciler) replicateImagePullSecret(ctx context.Context, providerConfig *apiv1alpha1.ProviderConfig, targetNamespace string) error {
-	if err := r.replicateSecret(ctx, providerConfig.GetImagePullSecret(), targetNamespace); err != nil {
-		return fmt.Errorf("failed to replicate image pull secret: %w", err)
-	}
-	return nil
-}
-
-// replicateSecret copies a secret referenced by name from the controller's namespace
-// (r.PodNamespace) on the platform cluster into targetNamespace. A nil ref is a no-op.
-func (r *KroReconciler) replicateSecret(ctx context.Context, ref *corev1.LocalObjectReference, targetNamespace string) error {
-	if ref == nil {
+// replicateChartPullSecret copies the named secret from the controller's namespace
+// (r.PodNamespace) on the platform cluster into targetNamespace, where the OCIRepository
+// references it. An empty secret name is a no-op.
+func (r *KroReconciler) replicateChartPullSecret(ctx context.Context, secretName, targetNamespace string) error {
+	if secretName == "" {
 		return nil
 	}
 	platformClient := r.PlatformCluster.Client()
 
 	sourceSecret := &corev1.Secret{}
-	sourceKey := client.ObjectKey{Name: ref.Name, Namespace: r.PodNamespace}
+	sourceKey := client.ObjectKey{Name: secretName, Namespace: r.PodNamespace}
 	if err := platformClient.Get(ctx, sourceKey, sourceSecret); err != nil {
-		return fmt.Errorf("failed to get secret %q from namespace %q: %w", ref.Name, r.PodNamespace, err)
+		return fmt.Errorf("failed to get secret %q from namespace %q: %w", secretName, r.PodNamespace, err)
 	}
 
 	targetSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ref.Name,
+			Name:      secretName,
 			Namespace: targetNamespace,
 		},
 	}
@@ -318,22 +320,22 @@ func (r *KroReconciler) replicateSecret(ctx context.Context, ref *corev1.LocalOb
 		targetSecret.Type = sourceSecret.Type
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to replicate secret %q to namespace %q: %w", ref.Name, targetNamespace, err)
+		return fmt.Errorf("failed to replicate secret %q to namespace %q: %w", secretName, targetNamespace, err)
 	}
 
 	return nil
 }
 
 // replicateMCPImagePullSecrets copies every secret referenced under
-// `imagePullSecrets` in the ProviderConfig Helm values from the controller's
+// `imagePullSecrets` in the version's Helm values from the controller's
 // own namespace on the platform cluster into the kro-system namespace on the
 // MCP cluster, so the deployed controller can pull its images from private
 // registries. The target namespace is created if it does not exist.
 //
 // Cleanup is not required: when the MCP is torn down or the chart namespace is
 // removed, the copied secrets are garbage-collected with it.
-func (r *KroReconciler) replicateMCPImagePullSecrets(ctx context.Context, mcpCluster *clusters.Cluster, providerConfig *apiv1alpha1.ProviderConfig) error {
-	helmValues, err := ExtractHelmValues(providerConfig.GetValues())
+func (r *KroReconciler) replicateMCPImagePullSecrets(ctx context.Context, mcpCluster *clusters.Cluster, values *apiextensionsv1.JSON) error {
+	helmValues, err := ExtractHelmValues(values)
 	if err != nil {
 		return err
 	}
@@ -375,8 +377,8 @@ func (r *KroReconciler) replicateMCPImagePullSecrets(ctx context.Context, mcpClu
 	return nil
 }
 
-func (r *KroReconciler) createOrUpdateOCIRepository(ctx context.Context, svcobj *apiv1alpha1.Kro, _ spruntime.ClusterContext, namespace string, providerConfig *apiv1alpha1.ProviderConfig) (*sourcev1.OCIRepository, error) {
-	ociRepository := createOciRepository(providerConfig, svcobj.Spec.Version, namespace)
+func (r *KroReconciler) createOrUpdateOCIRepository(ctx context.Context, version apiv1alpha1.KroVersion, namespace string) (*sourcev1.OCIRepository, error) {
+	ociRepository := createOciRepository(version, namespace)
 	managedObj := &sourcev1.OCIRepository{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ociRepository.Name,
@@ -395,8 +397,8 @@ func (r *KroReconciler) createOrUpdateOCIRepository(ctx context.Context, svcobj 
 	return managedObj, nil
 }
 
-func (r *KroReconciler) createOrUpdateHelmRelease(ctx context.Context, namespace string, svcobj *apiv1alpha1.Kro, providerConfig *apiv1alpha1.ProviderConfig) (*helmv2.HelmRelease, error) {
-	helmRelease, err := r.createHelmRelease(ctx, namespace, svcobj, providerConfig)
+func (r *KroReconciler) createOrUpdateHelmRelease(ctx context.Context, namespace string, svcobj *apiv1alpha1.Kro, values *apiextensionsv1.JSON) (*helmv2.HelmRelease, error) {
+	helmRelease, err := r.createHelmRelease(ctx, namespace, svcobj, values)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create helm release: %w", err)
 	}
@@ -418,17 +420,10 @@ func (r *KroReconciler) createOrUpdateHelmRelease(ctx context.Context, namespace
 	return managedObj, nil
 }
 
-func ensureOCIScheme(url *string) string {
-	if !strings.HasPrefix(*url, "oci://") {
-		return "oci://" + *url
-	}
-	return *url
-}
-
-func createOciRepository(providerConfig *apiv1alpha1.ProviderConfig, version, namespace string) *sourcev1.OCIRepository {
+func createOciRepository(version apiv1alpha1.KroVersion, namespace string) *sourcev1.OCIRepository {
 	var secretRef *meta.LocalObjectReference
-	if ref := providerConfig.GetImagePullSecret(); ref != nil {
-		secretRef = &meta.LocalObjectReference{Name: ref.Name}
+	if version.ChartPullSecret != "" {
+		secretRef = &meta.LocalObjectReference{Name: version.ChartPullSecret}
 	}
 
 	return &sourcev1.OCIRepository{
@@ -438,22 +433,20 @@ func createOciRepository(providerConfig *apiv1alpha1.ProviderConfig, version, na
 		},
 		Spec: sourcev1.OCIRepositorySpec{
 			Interval:  metav1.Duration{Duration: time.Minute},
-			URL:       ensureOCIScheme(providerConfig.GetChartURL()),
+			URL:       version.GetChartURL(),
 			SecretRef: secretRef,
 			Reference: &sourcev1.OCIRepositoryRef{
-				Tag: version,
+				Tag: version.ChartVersion,
 			},
 		},
 	}
 }
 
-func (r *KroReconciler) createHelmRelease(ctx context.Context, namespace string, svcobj *apiv1alpha1.Kro, providerConfig *apiv1alpha1.ProviderConfig) (*helmv2.HelmRelease, error) {
+func (r *KroReconciler) createHelmRelease(ctx context.Context, namespace string, svcobj *apiv1alpha1.Kro, helmValues *apiextensionsv1.JSON) (*helmv2.HelmRelease, error) {
 	fluxConfigRef, err := r.getMcpFluxConfig(ctx, namespace, svcobj.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get FluxConfig: %w", err)
 	}
-
-	helmValues := providerConfig.GetValues()
 
 	return &helmv2.HelmRelease{
 		ObjectMeta: metav1.ObjectMeta{
