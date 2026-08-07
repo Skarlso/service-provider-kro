@@ -172,10 +172,14 @@ func TestCreateOrUpdate_UnknownVersion(t *testing.T) {
 	res, err := r.CreateOrUpdate(context.Background(), obj, pc, spruntime.ClusterContext{})
 	require.NoError(t, err)
 	assert.Zero(t, res.RequeueAfter)
+	assert.Equal(t, spruntime.StatusPhaseProgressing, obj.Status.Phase)
 
+	// The phase cannot express this, so the Ready condition has to carry it: not ready,
+	// reason ReconcileError, and a message naming the versions on offer.
 	cond := apimeta.FindStatusCondition(obj.Status.Conditions, spruntime.ServiceProviderConditionReady)
 	require.NotNil(t, cond)
-	assert.Equal(t, spruntime.StatusPhaseFailed, cond.Reason)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, conditionReasonError, cond.Reason)
 	assert.Contains(t, cond.Message, `"9.9.9"`)
 	assert.Contains(t, cond.Message, "available versions are: 0.9.3")
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/fluxcd/pkg/apis/meta"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/openmcp-project/controller-utils/pkg/clusters"
+	ctrlerrors "github.com/openmcp-project/controller-utils/pkg/errors"
 	clustersv1alpha1 "github.com/openmcp-project/openmcp-operator/api/clusters/v1alpha1"
 	"github.com/openmcp-project/openmcp-operator/lib/clusteraccess"
 	libutils "github.com/openmcp-project/openmcp-operator/lib/utils"
@@ -62,6 +63,9 @@ const (
 	// deletionBlockedRequeue is how long to wait before re-checking whether the
 	// user's kro resources have been removed and deletion may proceed.
 	deletionBlockedRequeue = 10 * time.Second
+
+	// conditionReasonError is the Ready condition reason used when a reconcile step fails.
+	conditionReasonError = "ReconcileError"
 )
 
 // ClusterAccessName is the name of the access object containing the kubeconfig for the mcp target cluster.
@@ -93,28 +97,28 @@ func (r *KroReconciler) CreateOrUpdate(ctx context.Context, svcobj *apiv1alpha1.
 	version, err := providerConfig.ResolveVersion(svcobj.Spec.Version)
 	if err != nil {
 		l.Info("requested version is not offered by the provider config", "version", svcobj.Spec.Version, "error", err.Error())
-		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
-		return ctrl.Result{}, nil
+		spruntime.StatusProgressing(svcobj, conditionReasonError, err.Error())
+		return ctrl.Result{}, ctrlerrors.IgnoreInvalidUserInput(err)
 	}
 	l.Info("resolved requested version", "version", version.Version, "chartVersion", version.ChartVersion, "chartURL", version.GetChartURL())
 
 	if err := r.replicateChartPullSecret(ctx, version.ChartPullSecret, tenantNamespace); err != nil {
-		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
+		spruntime.StatusProgressing(svcobj, conditionReasonError, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to replicate chart pull secret: %w", err)
 	}
 
 	ociRepo, err := r.createOrUpdateOCIRepository(ctx, version, tenantNamespace)
 	if err != nil {
-		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
+		spruntime.StatusProgressing(svcobj, conditionReasonError, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile OCI Repository: %w", err)
 	}
 	if err := r.replicateMCPImagePullSecrets(ctx, clusterCtx.MCPCluster, version.HelmValues); err != nil {
-		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
+		spruntime.StatusProgressing(svcobj, conditionReasonError, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to replicate MCP image pull secrets: %w", err)
 	}
 	helmRel, err := r.createOrUpdateHelmRelease(ctx, tenantNamespace, svcobj, version.HelmValues)
 	if err != nil {
-		spruntime.StatusProgressing(svcobj, spruntime.StatusPhaseFailed, err.Error())
+		spruntime.StatusProgressing(svcobj, conditionReasonError, err.Error())
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile HelmRelease: %w", err)
 	}
 
@@ -170,7 +174,7 @@ func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, _ *api
 	if clusterCtx.MCPCluster != nil {
 		remaining, err := r.countResourceGraphDefinitions(ctx, clusterCtx.MCPCluster)
 		if err != nil {
-			spruntime.StatusProgressing(obj, spruntime.StatusPhaseFailed, err.Error())
+			spruntime.StatusTerminatingWithReason(obj, conditionReasonError, err.Error())
 			return ctrl.Result{}, fmt.Errorf("failed to check for remaining ResourceGraphDefinitions: %w", err)
 		}
 		if remaining > 0 {
@@ -196,7 +200,7 @@ func (r *KroReconciler) Delete(ctx context.Context, obj *apiv1alpha1.Kro, _ *api
 	objectsStillExist := false
 	for _, managedObj := range objects {
 		if err := r.PlatformCluster.Client().Delete(ctx, managedObj); client.IgnoreNotFound(err) != nil {
-			spruntime.StatusProgressing(obj, spruntime.StatusPhaseFailed, err.Error())
+			spruntime.StatusTerminatingWithReason(obj, conditionReasonError, err.Error())
 			return ctrl.Result{}, fmt.Errorf("delete object failed: %w", err)
 		}
 		// Only a NotFound confirms the object is gone. A successful Get means it is still
